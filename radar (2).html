@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Arduino Radar</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0a0f0a;
+    color: #00ff41;
+    font-family: 'Courier New', monospace;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px;
+  }
+  h1 { font-size: 13px; letter-spacing: 0.25em; color: #00cc33; text-transform: uppercase; margin-bottom: 20px; }
+  #radar-wrap { position: relative; width: min(90vw, 500px); aspect-ratio: 1; }
+  canvas { display: block; width: 100%; height: 100%; border-radius: 50%; }
+  #controls { display: flex; gap: 12px; margin-top: 20px; flex-wrap: wrap; justify-content: center; }
+  button {
+    background: transparent; border: 1px solid #00cc33; color: #00cc33;
+    font-family: inherit; font-size: 12px; letter-spacing: 0.1em;
+    padding: 8px 20px; cursor: pointer; text-transform: uppercase; transition: background 0.15s;
+  }
+  button:hover { background: rgba(0,204,51,0.12); }
+  button:disabled { opacity: 0.35; cursor: default; background: transparent; }
+  #stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 20px; width: min(90vw, 500px); }
+  .stat { background: rgba(0,255,65,0.05); border: 1px solid #00441a; padding: 10px 12px; text-align: center; }
+  .stat-label { font-size: 10px; letter-spacing: 0.15em; color: #006622; text-transform: uppercase; display: block; margin-bottom: 4px; }
+  .stat-value { font-size: 20px; font-weight: bold; color: #00ff41; }
+  .stat-unit { font-size: 10px; color: #006622; margin-left: 2px; }
+  #log { margin-top: 16px; width: min(90vw, 500px); font-size: 11px; color: #005c1f; letter-spacing: 0.05em; min-height: 18px; }
+</style>
+</head>
+<body>
+
+<h1>Arduino Radar System</h1>
+<div id="radar-wrap"><canvas id="radar"></canvas></div>
+
+<div id="controls">
+  <button id="btn-connect">Connect Serial</button>
+  <button id="btn-disconnect" disabled>Disconnect</button>
+  <button id="btn-clear">Clear</button>
+</div>
+
+<div id="stats">
+  <div class="stat"><span class="stat-label">Angle</span><span class="stat-value" id="s-angle">--</span><span class="stat-unit">°</span></div>
+  <div class="stat"><span class="stat-label">Distance</span><span class="stat-value" id="s-dist">--</span><span class="stat-unit">cm</span></div>
+  <div class="stat"><span class="stat-label">Max Range</span><span class="stat-value" id="s-range">200</span><span class="stat-unit">cm</span></div>
+</div>
+
+<div id="log">-- disconnected --</div>
+
+<script>
+const canvas = document.getElementById('radar');
+const ctx = canvas.getContext('2d');
+const log = document.getElementById('log');
+
+const MAX_RANGE = 80;
+const DOT_LIFETIME = 15000;
+
+// Sweep animation — fully independent of Arduino
+const SWEEP_SPEED = 90; // degrees per second — change this to go faster/slower
+let sweepAngle = 0;
+let sweepDir = 1; // 1 = increasing, -1 = decreasing
+let lastTime = null;
+
+let port = null;
+let reader = null;
+let readBuffer = '';
+let points = [];
+
+function resize() {
+  const size = canvas.offsetWidth;
+  canvas.width = size;
+  canvas.height = size;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function draw(ts) {
+  if (!lastTime) lastTime = ts;
+  const dt = (ts - lastTime) / 1000; // seconds since last frame
+  lastTime = ts;
+
+  // Advance sweep independently
+  sweepAngle += SWEEP_SPEED * dt * sweepDir;
+  if (sweepAngle >= 180) { sweepAngle = 180; sweepDir = -1; }
+  if (sweepAngle <= 0)   { sweepAngle = 0;   sweepDir = 1;  }
+
+  const W = canvas.width;
+  const H = canvas.height;
+  const cx = W / 2;
+  const cy = H / 2;
+  const R = (W / 2) - 4;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Background
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.fillStyle = '#050e05';
+  ctx.fill();
+
+  // Range rings
+  for (let i = 1; i <= 4; i++) {
+    const r = (R / 4) * i;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.strokeStyle = '#0a3a0a';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = '#154d15';
+    ctx.font = `${Math.max(9, W * 0.022)}px 'Courier New'`;
+    ctx.fillText(Math.round((MAX_RANGE / 4) * i) + 'cm', cx + 3, cy - r + 12);
+  }
+
+  // Angle lines every 30°
+  for (let a = 0; a <= 180; a += 30) {
+    const rad = (a * Math.PI) / 180;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + R * Math.cos(Math.PI - rad), cy - R * Math.sin(Math.PI - rad));
+    ctx.strokeStyle = '#0a3a0a';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = '#1a5c1a';
+    ctx.font = `${Math.max(9, W * 0.022)}px 'Courier New'`;
+    const lx = cx + (R - 16) * Math.cos(Math.PI - rad);
+    const ly = cy - (R - 16) * Math.sin(Math.PI - rad);
+    ctx.fillText(a + '°', lx - 10, ly + 4);
+  }
+
+  // Sweep trail
+  for (let t = 1; t <= 18; t++) {
+    const ta = sweepAngle - t * sweepDir;
+    if (ta < 0 || ta > 180) continue;
+    const alpha = (1 - t / 18) * 0.18;
+    const a1 = Math.PI - (ta * Math.PI / 180);
+    const a2 = Math.PI - ((ta - sweepDir) * Math.PI / 180);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, R, Math.min(a1,a2), Math.max(a1,a2));
+    ctx.closePath();
+    ctx.fillStyle = `rgba(0,255,65,${alpha})`;
+    ctx.fill();
+  }
+
+  // Sweep line
+  const sweepRad = Math.PI - (sweepAngle * Math.PI / 180);
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + R * Math.cos(sweepRad), cy - R * Math.sin(sweepRad));
+  ctx.strokeStyle = '#00ff41';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Dots from real Arduino data
+  const now = performance.now();
+  for (let i = points.length - 1; i >= 0; i--) {
+    const p = points[i];
+    const age = now - p.timestamp;
+    if (age > DOT_LIFETIME) { points.splice(i, 1); continue; }
+    const alpha = 1 - age / DOT_LIFETIME;
+    const r = Math.min(p.dist / MAX_RANGE, 1) * R;
+    const a = Math.PI - (p.angle * Math.PI / 180);
+    const px = cx + r * Math.cos(a);
+    const py = cy - r * Math.sin(a);
+
+    ctx.beginPath();
+    ctx.arc(px, py, Math.max(6, W * 0.014), 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(0,255,65,${alpha * 0.3})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(px, py, Math.max(3, W * 0.007), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0,255,65,${alpha})`;
+    ctx.fill();
+  }
+
+  // Center dot
+  ctx.beginPath();
+  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#00ff41';
+  ctx.fill();
+
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// ---- Serial ----
+function setLog(msg) { log.textContent = msg; }
+
+function parseLine(line) {
+  line = line.trim();
+  if (!line) return;
+  const parts = line.split(',');
+  if (parts.length !== 2) return;
+  const angle = parseFloat(parts[0]);
+  const dist = parseFloat(parts[1]);
+  if (isNaN(angle) || isNaN(dist)) return;
+  if (angle < 0 || angle > 180) return;
+
+  document.getElementById('s-angle').textContent = Math.round(angle);
+  document.getElementById('s-dist').textContent = dist.toFixed(1);
+
+  if (dist > 0 && dist <= MAX_RANGE) {
+    points.push({ angle, dist, timestamp: performance.now() });
+  }
+}
+
+async function readLoop() {
+  try {
+    while (port && port.readable) {
+      reader = port.readable.getReader();
+      const decoder = new TextDecoder();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          readBuffer += decoder.decode(value);
+          const lines = readBuffer.split('\n');
+          readBuffer = lines.pop();
+          for (const line of lines) parseLine(line);
+        }
+      } finally {
+        reader.releaseLock();
+        reader = null;
+      }
+    }
+  } catch(e) { setLog('-- serial error: ' + e.message + ' --'); }
+}
+
+document.getElementById('btn-connect').addEventListener('click', async () => {
+  if (!('serial' in navigator)) { setLog('Web Serial not supported. Use Chrome or Edge.'); return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600 });
+    setLog('-- connected at 9600 baud --');
+    document.getElementById('btn-connect').disabled = true;
+    document.getElementById('btn-disconnect').disabled = false;
+    readLoop();
+  } catch(e) { setLog('-- connection failed: ' + e.message + ' --'); }
+});
+
+document.getElementById('btn-disconnect').addEventListener('click', async () => {
+  try {
+    if (reader) { await reader.cancel(); reader = null; }
+    if (port) { await port.close(); port = null; }
+  } catch(e) {}
+  setLog('-- disconnected --');
+  document.getElementById('btn-connect').disabled = false;
+  document.getElementById('btn-disconnect').disabled = true;
+});
+
+document.getElementById('btn-clear').addEventListener('click', () => { points = []; });
+</script>
+</body>
+</html>
