@@ -49,7 +49,7 @@ void loop() {
     delayMicroseconds(10);
     digitalWrite(trigPin, LOW);
 
-    pingTime = pulseIn(echoPin, HIGH);
+    pingTime = pulseIn(echoPin, HIGH, 30000);
     pingTime = pingTime / 1000000.0;
     targetDistance = (pingTime / 2.0) * speedOfSound_cm_s;
 
